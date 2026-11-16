@@ -1,0 +1,25 @@
+# Unreal Engine: generated on build / by the editor, never commit
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+Plugins/**/Binaries/
+Plugins/**/Intermediate/
+
+# Personal editor folders inside Content
+Content/Developers/
+
+# Visual Studio / IDE files (regenerated with "Generate Visual Studio project files")
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Leftover backups
+*.uproject.copy
+*.bak

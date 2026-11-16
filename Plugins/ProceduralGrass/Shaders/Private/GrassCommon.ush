@@ -1,0 +1,105 @@
+// ProceduralGrass - shared declarations for the generation compute shader and the blade vertex factory.
+// Based on the technique described in "Procedural Grass in Ghost of Tsushima" (Eric Wohllaib, GDC 2021).
+
+#pragma once
+
+/**
+ * One grass blade as written by GenerateBladesCS and read by the vertex factory.
+ * 48 bytes. Keep in sync with FGrassBladeGPU in GrassSceneProxy.cpp.
+ */
+struct FGrassBlade
+{
+	float3 Position;	// Root position in component local space (cm).
+	float  Height;		// Blade length (cm).
+	float2 Facing;		// Unit 2D direction the blade leans towards.
+	float  Width;		// Blade width at the root (cm).
+	float  Tilt;		// 0 = vertical, 1 = lying flat.
+	float  Bend;		// Curvature of the blade (offset of the Bezier mid control points).
+	float  Hash;		// Per-blade random value in [0,1).
+	float  Wind;		// Wind strength at the blade, drives the bobbing animation.
+	uint   Packed;		// Bits 0-7: brightness (0..255 -> 0..2). Bit 8: mowing stripe parity.
+};
+
+// Draw 0 (high detail blades) and draw 1 (low detail blades) share one indirect args buffer.
+// Each draw is the usual 5 uints: IndexCount, InstanceCount, StartIndex, BaseVertex, StartInstance.
+#define GRASS_ARGS_HIGH_INDEX_COUNT		0
+#define GRASS_ARGS_HIGH_INSTANCE_COUNT	1
+#define GRASS_ARGS_LOW_INDEX_COUNT		5
+#define GRASS_ARGS_LOW_INSTANCE_COUNT	6
+
+// Blades whose continuous LOD is below this use the high detail (15 vertex) blade mesh.
+#define GRASS_HIGH_DETAIL_LOD 1.0f
+
+uint GrassHashUint(uint X)
+{
+	X ^= X >> 16;
+	X *= 0x7feb352du;
+	X ^= X >> 15;
+	X *= 0x846ca68bu;
+	X ^= X >> 16;
+	return X;
+}
+
+uint GrassHash2D(uint2 P)
+{
+	return GrassHashUint(P.x ^ GrassHashUint(P.y + 0x9e3779b9u));
+}
+
+float GrassHashToFloat(uint H)
+{
+	return (float)(H & 0x00ffffffu) / 16777216.0f;
+}
+
+/** Independent random value in [0,1) for a seed and a channel index. */
+float GrassRand(uint Seed, uint Channel)
+{
+	return GrassHashToFloat(GrassHashUint(Seed + Channel * 0x9e3779b9u));
+}
+
+/** Bilinear value noise in [0,1]. */
+float GrassValueNoise(float2 P)
+{
+	const float2 Cell = floor(P);
+	float2 F = P - Cell;
+	F = F * F * (3.0f - 2.0f * F);
+
+	const int2 I = int2(Cell);
+	const float A = GrassHashToFloat(GrassHash2D(uint2(I)));
+	const float B = GrassHashToFloat(GrassHash2D(uint2(I + int2(1, 0))));
+	const float C = GrassHashToFloat(GrassHash2D(uint2(I + int2(0, 1))));
+	const float D = GrassHashToFloat(GrassHash2D(uint2(I + int2(1, 1))));
+
+	return lerp(lerp(A, B, F.x), lerp(C, D, F.x), F.y);
+}
+
+/**
+ * Voronoi clump lookup. Clump points sit on a jittered grid with the given cell size.
+ * Returns the centre and a seed for the clump nearest to P.
+ */
+void GrassFindClump(float2 P, float ClumpSize, out float2 OutCenter, out uint OutSeed)
+{
+	const float2 Scaled = P / max(ClumpSize, 1.0f);
+	const int2 BaseCell = int2(floor(Scaled));
+
+	float BestDistSq = 1e20f;
+	OutCenter = P;
+	OutSeed = 0;
+
+	for (int Y = -1; Y <= 1; ++Y)
+	{
+		for (int X = -1; X <= 1; ++X)
+		{
+			const int2 Cell = BaseCell + int2(X, Y);
+			const uint Seed = GrassHash2D(uint2(Cell) + 0x51ed270bu);
+			const float2 ClumpPoint = (float2(Cell) + float2(GrassRand(Seed, 0), GrassRand(Seed, 1))) * ClumpSize;
+			const float2 Delta = ClumpPoint - P;
+			const float DistSq = dot(Delta, Delta);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				OutCenter = ClumpPoint;
+				OutSeed = Seed;
+			}
+		}
+	}
+}

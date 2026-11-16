@@ -1,0 +1,396 @@
+// ProceduralGrass - blade vertex factory.
+//
+// No vertex buffers are bound. Every blade is one instance; the vertex shader reads the blade from the
+// instance buffer written by GenerateBladesCS and builds the geometry from a cubic Bezier curve, as in
+// "Procedural Grass in Ghost of Tsushima".
+//
+// What a material gets:
+//   Vertex Color RGB = root/tip colour gradient * per-blade brightness, A = 0 at the root .. 1 at the tip
+//   TexCoord0 = (across the blade, along the blade)
+//   TexCoord1 = position on the field, 0..1
+//   TexCoord2 = (per-blade random, mowing stripe parity)
+//   TexCoord3 = (wind strength, blade height in cm)
+
+#include "/Engine/Private/VertexFactoryCommon.ush"
+#include "GrassCommon.ush"
+
+StructuredBuffer<FGrassBlade> GrassInstanceBuffer;
+float4 GrassDrawParams;		// x = first instance in the buffer, y = segments per blade, z = time, w = previous frame time
+float4 GrassShapeParams;	// x = normal rounding, y = view space thickening, z = bob amplitude, w = bob speed
+float4 GrassRootColor;
+float4 GrassTipColor;
+float4 GrassFieldParams;	// xy = field min (local), zw = 1 / field size
+float4 GrassWindParams;		// xy = wind direction (local), z = bob wave number (radians per cm)
+
+#undef GetInstanceIdFromVF
+#define GetInstanceIdFromVF(VFInput)				(VFInput.InstanceId)
+
+/** Per-vertex inputs. No vertex buffers are bound. */
+struct FVertexFactoryInput
+{
+	uint InstanceId : SV_InstanceID;
+	uint VertexId : SV_VertexID;
+	VF_MOBILE_MULTI_VIEW_DECLARE_INPUT_BLOCK()
+};
+
+/** Cached intermediates that would otherwise have to be computed multiple times. */
+struct FVertexFactoryIntermediates
+{
+	float3 LocalPos;
+	float3 PrevLocalPos;
+	float3 WorldNormal;		// rounded shading normal
+	float3 WorldFaceNormal;	// flat normal of the blade surface
+	float3 WorldSide;		// direction across the blade
+	float HalfWidth;
+	float SideSign;			// -1 left edge, +1 right edge, 0 tip
+	float AlongBlade;		// 0 root .. 1 tip
+	half4 Color;
+	float2 TexCoords[4];
+	/** Cached primitive and instance data */
+	FSceneDataIntermediates SceneData;
+};
+
+FPrimitiveSceneData GetPrimitiveData(FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.SceneData.Primitive;
+}
+
+/** Attributes to interpolate from the vertex shader to the pixel shader. */
+struct FVertexFactoryInterpolantsVSToPS
+{
+	TANGENTTOWORLD_INTERPOLATOR_BLOCK
+
+	half4 Color : COLOR0;
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	float4 TexCoords[(NUM_TEX_COORD_INTERPOLATORS + 1) / 2] : TEXCOORD0;
+#endif
+};
+
+/** Position, tangent and width of the blade at one vertex. */
+struct FGrassBladePoint
+{
+	float3 Position;	// relative to the blade root, local space
+	float3 Tangent;		// along the blade
+	float HalfWidth;
+};
+
+/**
+ * Evaluate the blade curve.
+ * The blade lives in the plane spanned by its facing direction and up. P0 is the root and P3 the tip;
+ * tilt decides how far the tip leans over and bend pushes the two middle control points off the
+ * root-tip line. Wind makes the blade bob, with the motion growing towards the tip.
+ */
+FGrassBladePoint EvaluateGrassBlade(FGrassBlade Blade, float T, float Time)
+{
+	const float3 Forward = float3(Blade.Facing, 0.0f);
+	const float3 Up = float3(0.0f, 0.0f, 1.0f);
+
+	// The bob is a wave travelling across the field with the wind, so neighbouring blades move together.
+	// A small per-blade offset keeps it from looking mechanical. (Fully random phases make every blade
+	// twitch on its own, which reads as flicker when looking down at the grass.)
+	const float Phase = dot(Blade.Position.xy, GrassWindParams.xy) * GrassWindParams.z - Time * GrassShapeParams.w + Blade.Hash * 1.5f;
+	const float Bob = Blade.Wind * GrassShapeParams.z;
+	const float Tilt = saturate(Blade.Tilt + sin(Phase) * Bob);
+	const float Bend = Blade.Bend * (1.0f + sin(Phase + 1.7f) * Bob * 2.0f);
+
+	const float TiltAngle = Tilt * (0.5f * PI);
+	const float SinTilt = sin(TiltAngle);
+	const float CosTilt = cos(TiltAngle);
+
+	const float3 ChordDir = Forward * SinTilt + Up * CosTilt;
+	const float3 ChordNormal = Up * SinTilt - Forward * CosTilt;
+
+	const float3 P3 = ChordDir * Blade.Height;
+	const float3 P1 = P3 * 0.33f + ChordNormal * (Bend * Blade.Height * 0.6f);
+	const float3 P2 = P3 * 0.66f + ChordNormal * (Bend * Blade.Height);
+
+	const float InvT = 1.0f - T;
+
+	FGrassBladePoint Result;
+	Result.Position = P1 * (3.0f * InvT * InvT * T) + P2 * (3.0f * InvT * T * T) + P3 * (T * T * T);
+
+	const float3 Derivative = P1 * (3.0f * InvT * InvT) + (P2 - P1) * (6.0f * InvT * T) + (P3 - P2) * (3.0f * T * T);
+	const float DerivativeLen = length(Derivative);
+	Result.Tangent = (DerivativeLen > 0.0001f) ? (Derivative / DerivativeLen) : Up;
+
+	// Slight taper along the blade. The tip itself is a single vertex.
+	Result.HalfWidth = 0.5f * Blade.Width * (1.0f - 0.7f * T * T);
+	return Result;
+}
+
+/** Compute the intermediates for a given vertex. */
+FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
+{
+	FVertexFactoryIntermediates Intermediates;
+	Intermediates.SceneData = VF_GPUSCENE_GET_INTERMEDIATES(Input);
+
+	const FGrassBlade Blade = GrassInstanceBuffer[(uint)GrassDrawParams.x + Input.InstanceId];
+
+	// Vertices come in left/right pairs going up the blade, followed by one tip vertex.
+	const uint NumSegments = (uint)GrassDrawParams.y;
+	const bool bTip = Input.VertexId >= NumSegments * 2u;
+	const float T = bTip ? 1.0f : (float)(Input.VertexId >> 1u) / (float)NumSegments;
+	const float SideSign = bTip ? 0.0f : ((Input.VertexId & 1u) ? 1.0f : -1.0f);
+
+	const FGrassBladePoint Point0 = EvaluateGrassBlade(Blade, T, GrassDrawParams.z);
+	const FGrassBladePoint PrevPoint = EvaluateGrassBlade(Blade, T, GrassDrawParams.w);
+
+	const float3 LocalSide = float3(-Blade.Facing.y, Blade.Facing.x, 0.0f);
+	const float3 LocalFaceNormal = normalize(cross(Point0.Tangent, LocalSide));
+
+	Intermediates.LocalPos = Blade.Position + Point0.Position + LocalSide * (SideSign * Point0.HalfWidth);
+	Intermediates.PrevLocalPos = Blade.Position + PrevPoint.Position + LocalSide * (SideSign * PrevPoint.HalfWidth);
+
+	// Tilt the normal outwards at the two edges so a flat blade shades as if it had a rounded cross section.
+	const float3 LocalNormal = normalize(LocalFaceNormal + LocalSide * (SideSign * GrassShapeParams.x));
+
+	const FPrimitiveSceneData PrimitiveData = Intermediates.SceneData.Primitive;
+	Intermediates.WorldNormal = normalize(RotateLocalToWorld(LocalNormal, PrimitiveData.LocalToWorld, PrimitiveData.InvNonUniformScale));
+	Intermediates.WorldFaceNormal = normalize(RotateLocalToWorld(LocalFaceNormal, PrimitiveData.LocalToWorld, PrimitiveData.InvNonUniformScale));
+	Intermediates.WorldSide = normalize(RotateLocalToWorld(LocalSide, PrimitiveData.LocalToWorld, PrimitiveData.InvNonUniformScale));
+
+	Intermediates.HalfWidth = Point0.HalfWidth;
+	Intermediates.SideSign = SideSign;
+	Intermediates.AlongBlade = T;
+
+	const float Brightness = (float)(Blade.Packed & 0xffu) * (2.0f / 255.0f);
+	const float StripeParity = (float)((Blade.Packed >> 8u) & 1u);
+	Intermediates.Color = half4(lerp(GrassRootColor.rgb, GrassTipColor.rgb, T) * Brightness, T);
+
+	Intermediates.TexCoords[0] = float2(SideSign * 0.5f + 0.5f, T);
+	Intermediates.TexCoords[1] = (Blade.Position.xy - GrassFieldParams.xy) * GrassFieldParams.zw;
+	Intermediates.TexCoords[2] = float2(Blade.Hash, StripeParity);
+	Intermediates.TexCoords[3] = float2(Blade.Wind, Blade.Height);
+
+	return Intermediates;
+}
+
+/**
+ * View space thickening: a blade seen edge-on would be thinner than a pixel and shimmer, so its two
+ * edges are pushed apart along the camera's right vector when the blade faces away from the camera.
+ */
+float3 GetGrassViewThickenOffset(FVertexFactoryIntermediates Intermediates, float3 TranslatedWorldPosition)
+{
+	const float3 CameraVector = normalize(ResolvedView.TranslatedWorldCameraOrigin - TranslatedWorldPosition);
+	const float ViewDotNormal = abs(dot(CameraVector, Intermediates.WorldFaceNormal));
+	const float EdgeOn = 1.0f - ViewDotNormal;
+	// Thickening is meant for blades seen from the side. Looking along a blade (straight down at upright
+	// grass) there is no thin edge to fix, so it fades out there.
+	const float3 BladeDirection = normalize(cross(Intermediates.WorldSide, Intermediates.WorldFaceNormal));
+	const float AlongView = dot(CameraVector, BladeDirection);
+	const float SideView = saturate(1.0f - AlongView * AlongView * 2.0f);
+	const float Thicken = EdgeOn * EdgeOn * EdgeOn * EdgeOn * smoothstep(0.0f, 0.2f, ViewDotNormal) * SideView * GrassShapeParams.y;
+	const float3 ViewRight = ResolvedView.ViewRight;
+	const float ScreenSide = (dot(Intermediates.WorldSide, ViewRight) < 0.0f) ? -1.0f : 1.0f;
+	return ViewRight * (ScreenSide * Intermediates.SideSign * Intermediates.HalfWidth * Thicken);
+}
+
+float3 VertexFactoryGetPreviousInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates);
+float3 VertexFactoryGetInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates);
+
+/** Converts from vertex factory specific input to a FMaterialVertexParameters, which is used by vertex shader material inputs. */
+FMaterialVertexParameters GetMaterialVertexParameters(
+	FVertexFactoryInput Input,
+	FVertexFactoryIntermediates Intermediates,
+	float3 WorldPosition,
+	half3x3 TangentToLocal,
+	bool bIsPreviousFrame = false)
+{
+	FMaterialVertexParameters Result = MakeInitializedMaterialVertexParameters();
+
+	Result.SceneData = Intermediates.SceneData;
+
+	Result.WorldPosition = WorldPosition;
+	if (bIsPreviousFrame)
+	{
+		Result.PositionInstanceSpace = VertexFactoryGetPreviousInstanceSpacePosition(Input, Intermediates);
+	}
+	else
+	{
+		Result.PositionInstanceSpace = VertexFactoryGetInstanceSpacePosition(Input, Intermediates);
+	}
+	Result.PositionPrimitiveSpace = Result.PositionInstanceSpace; // No GPU Scene instancing, so instance == primitive
+
+	Result.TangentToWorld[0] = Intermediates.WorldSide;
+	Result.TangentToWorld[1] = cross(Intermediates.WorldNormal, Intermediates.WorldSide);
+	Result.TangentToWorld[2] = Intermediates.WorldNormal;
+
+	Result.PreSkinnedPosition = Intermediates.LocalPos;
+	Result.PreSkinnedNormal = float3(0, 0, 1);
+
+	Result.VertexColor = Intermediates.Color;
+
+#if NUM_MATERIAL_TEXCOORDS_VERTEX
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < NUM_MATERIAL_TEXCOORDS_VERTEX; CoordinateIndex++)
+	{
+		Result.TexCoords[CoordinateIndex] = Intermediates.TexCoords[min(CoordinateIndex, 3)];
+	}
+#endif  //NUM_MATERIAL_TEXCOORDS_VERTEX
+
+	Result.LWCData = MakeMaterialLWCData(Result);
+
+	return Result;
+}
+
+/** Get ID in GPU Scene. Not used because this factory creates and consumes its own instance buffer. */
+uint GetPrimitiveId(FVertexFactoryInterpolantsVSToPS Interpolants)
+{
+	return 0;
+}
+
+/** Get ID in the GPU Scene. */
+uint VertexFactoryGetPrimitiveId(FVertexFactoryInterpolantsVSToPS Interpolants)
+{
+	return GetPrimitiveId(Interpolants);
+}
+
+/** Computes the world space position of this vertex. */
+float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	FDFMatrix LocalToWorld = GetPrimitiveData(Intermediates).LocalToWorld;
+	float4 TranslatedWorldPosition = TransformLocalToTranslatedWorld(Intermediates.LocalPos, LocalToWorld);
+	TranslatedWorldPosition.xyz += GetGrassViewThickenOffset(Intermediates, TranslatedWorldPosition.xyz);
+	return TranslatedWorldPosition;
+}
+
+// local position relative to instance
+float3 VertexFactoryGetInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.LocalPos; // No GPU Scene instancing, so instance == primitive
+}
+
+/** Computes the world space position of this vertex. */
+float4 VertexFactoryGetRasterizedWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float4 InWorldPosition)
+{
+	return InWorldPosition;
+}
+
+/** Computes the world space position used by vertex lighting for this vertex. */
+float3 VertexFactoryGetPositionForVertexLighting(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float3 TranslatedWorldPosition)
+{
+	return TranslatedWorldPosition;
+}
+
+/** Computes the world space position of this vertex last frame. */
+float4 VertexFactoryGetPreviousWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	float4 PrevTranslatedWorldPosition = DFTransformLocalToTranslatedWorld(Intermediates.PrevLocalPos, GetPrimitiveData(Intermediates).PreviousLocalToWorld, ResolvedView.PrevPreViewTranslation);
+	// Same thickening offset as the current frame so it does not show up as motion.
+	FDFMatrix LocalToWorld = GetPrimitiveData(Intermediates).LocalToWorld;
+	const float3 TranslatedWorldPosition = TransformLocalToTranslatedWorld(Intermediates.LocalPos, LocalToWorld).xyz;
+	PrevTranslatedWorldPosition.xyz += GetGrassViewThickenOffset(Intermediates, TranslatedWorldPosition);
+	return PrevTranslatedWorldPosition;
+}
+
+/** Computes the instance space position of this vertex last frame. */
+float3 VertexFactoryGetPreviousInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.PrevLocalPos; // No GPU Scene instancing, so instance == primitive
+}
+
+/** Computes the world space normal of this vertex. */
+float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.WorldNormal;
+}
+
+/** Get the 3x3 tangent basis vectors for this vertex factory. The real basis is built in world space in GetMaterialVertexParameters. */
+half3x3 VertexFactoryGetTangentToLocal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return half3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+}
+
+/** Get the translated bounding sphere for this primitive. */
+float4 VertexFactoryGetTranslatedPrimitiveVolumeBounds(FVertexFactoryInterpolantsVSToPS Interpolants)
+{
+	FPrimitiveSceneData PrimitiveData = GetPrimitiveData(GetPrimitiveId(Interpolants));
+	return float4(DFFastToTranslatedWorld(PrimitiveData.ObjectWorldPosition, ResolvedView.PreViewTranslation), PrimitiveData.ObjectRadius);
+}
+
+#if NUM_TEX_COORD_INTERPOLATORS
+
+void SetUV(inout FVertexFactoryInterpolantsVSToPS Interpolants, uint UVIndex, float2 InValue)
+{
+	FLATTEN
+	if (UVIndex % 2)
+	{
+		Interpolants.TexCoords[UVIndex / 2].zw = InValue;
+	}
+	else
+	{
+		Interpolants.TexCoords[UVIndex / 2].xy = InValue;
+	}
+}
+
+float2 GetUV(FVertexFactoryInterpolantsVSToPS Interpolants, uint UVIndex)
+{
+	float4 UVVector = Interpolants.TexCoords[UVIndex / 2];
+	return UVIndex % 2 ? UVVector.zw : UVVector.xy;
+}
+
+#endif
+
+/** Constructs values that need to be interpolated from the vertex shader to the pixel shader. */
+FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
+{
+	FVertexFactoryInterpolantsVSToPS Interpolants;
+
+	// Initialize the whole struct to 0
+	Interpolants = (FVertexFactoryInterpolantsVSToPS)0;
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	float2 CustomizedUVs[NUM_TEX_COORD_INTERPOLATORS];
+	GetMaterialCustomizedUVs(VertexParameters, CustomizedUVs);
+	GetCustomInterpolators(VertexParameters, CustomizedUVs);
+
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; CoordinateIndex++)
+	{
+		SetUV(Interpolants, CoordinateIndex, CustomizedUVs[CoordinateIndex]);
+	}
+#endif
+
+	Interpolants.TangentToWorld0 = float4(Intermediates.WorldSide, 0);
+	Interpolants.TangentToWorld2 = float4(Intermediates.WorldNormal, 1);
+#if USE_WORLDVERTEXNORMAL_CENTER_INTERPOLATION
+	Interpolants.TangentToWorld2_Center = Interpolants.TangentToWorld2;
+#endif
+
+	Interpolants.Color = Intermediates.Color;
+
+	return Interpolants;
+}
+
+/** Converts from vertex factory specific interpolants to a FMaterialPixelParameters, which is used by material inputs. */
+FMaterialPixelParameters GetMaterialPixelParameters(FVertexFactoryInterpolantsVSToPS Interpolants, float4 SvPosition)
+{
+	// GetMaterialPixelParameters is responsible for fully initializing the result
+	FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	UNROLL
+	for (uint CoordinateIndex = 0; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; CoordinateIndex++)
+	{
+		Result.TexCoords[CoordinateIndex] = GetUV(Interpolants, CoordinateIndex);
+	}
+#endif	//NUM_MATERIAL_TEXCOORDS
+
+	half3 TangentToWorld0 = Interpolants.TangentToWorld0.xyz;
+	half4 TangentToWorld2 = Interpolants.TangentToWorld2;
+	Result.UnMirrored = TangentToWorld2.w;
+	Result.TangentToWorld = AssembleTangentToWorld(TangentToWorld0, TangentToWorld2);
+#if USE_WORLDVERTEXNORMAL_CENTER_INTERPOLATION
+	Result.WorldVertexNormal_Center = Interpolants.TangentToWorld2_Center.xyz;
+#endif
+
+	Result.VertexColor = Interpolants.Color;
+
+	Result.TwoSidedSign = 1;
+	Result.PrimitiveId = GetPrimitiveId(Interpolants);
+
+	return Result;
+}
+
+#include "/Engine/Private/VertexFactoryDefaultInterface.ush"

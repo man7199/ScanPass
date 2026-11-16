@@ -1,0 +1,317 @@
+// ProceduralGrass - GPU blade generation, LOD and culling.
+//
+// One thread = one candidate blade. Tiles are culled and given a LOD on the CPU, then every LOD gets a
+// single dispatch with Z = number of tiles. Each thread builds its blade (position, clumping, mowing
+// stripes, wind, interaction), fades it by continuous LOD, frustum culls it and appends the survivors
+// to the instance buffer. The instance counts are written straight into the draw indirect args.
+
+#include "/Engine/Private/Common.ush"
+#include "GrassCommon.ush"
+
+StructuredBuffer<float4> TileBuffer;				// xy = tile min corner (local cm), zw = integer tile coordinate
+RWStructuredBuffer<FGrassBlade> RWInstanceBuffer;	// [0, MaxBladesHigh) high detail, [MaxBladesHigh, +MaxBladesLow) low detail
+RWBuffer<uint> RWIndirectArgsBuffer;
+
+// View
+float4x4 GrassLocalToClip;
+float3 GrassCameraPosition;	// component local space
+float GrassCullMargin;
+float GrassTime;
+
+// Layout
+float2 FieldMin;
+float2 FieldMax;
+float TileSize;
+uint BladesPerSideLod0;
+uint DispatchLod;
+uint TileOffset;
+uint MaxLod;
+float Lod0Distance;
+float MaxDrawDistance;
+float WidthLodScale;
+uint MaxBladesHigh;
+uint MaxBladesLow;
+uint IndexCountHigh;
+uint IndexCountLow;
+
+// Blade shape
+float BladeHeight;
+float HeightVariation;
+float BladeWidth;
+float BaseTilt;
+float TiltVariation;
+float BaseBend;
+
+// Clumping
+float ClumpSize;
+float ClumpPull;
+float ClumpHeightVariation;
+float ClumpFacing;
+
+// Mowing stripes and colour
+float StripeWidth;
+float MowStrength;
+float StripeContrast;
+float ColorVariation;
+
+// Wind
+float2 WindDirection;
+float WindStrength;
+float WindSpeed;
+float WindNoiseScale;
+
+// Interaction (ball, feet...). Each is a capsule: Interactors = start xyz and radius,
+// InteractorEnds = end xyz and vertical reach. A sphere has start == end and reach == radius.
+float4 Interactors[16];
+float4 InteractorEnds[16];
+uint NumInteractors;
+
+// Conforming to objects. An orthographic depth capture looks up at the interacting actors from below the
+// pitch, so every texel holds how far above the ground the lowest surface is at that spot.
+Texture2D ConformDepthTexture;
+SamplerState ConformDepthSampler;
+float4 ConformUPlane;	// dot(float4(LocalPosition, 1), ConformUPlane) = U in the capture
+float4 ConformVPlane;
+float4 ConformParams;	// x = enabled, y = distance of the capture camera below the pitch, z = clearance (cm)
+
+/** Height above the pitch of the lowest object surface over a point. Very large when nothing is there. */
+float GrassGetObjectUnderside(float3 LocalPosition)
+{
+	const float2 UV = float2(dot(float4(LocalPosition, 1.0f), ConformUPlane), dot(float4(LocalPosition, 1.0f), ConformVPlane));
+	if (any(UV < 0.0f) || any(UV > 1.0f))
+	{
+		return 1000000.0f;
+	}
+
+	// Take the lowest of the four nearest texels. That grows the footprint by up to a texel, which is the
+	// safe direction: a blade is pressed slightly early rather than poking through an edge.
+	const float4 Depths = ConformDepthTexture.GatherRed(ConformDepthSampler, UV);
+	const float Depth = min(min(Depths.x, Depths.y), min(Depths.z, Depths.w));
+
+	// Zero means the capture has not rendered yet.
+	if (Depth < ConformParams.y * 0.5f)
+	{
+		return 1000000.0f;
+	}
+	return Depth - ConformParams.y;
+}
+
+
+/** Reset both draws. Buffers are pooled, so this has to run every frame before generation. */
+[numthreads(1, 1, 1)]
+void InitArgsCS()
+{
+	RWIndirectArgsBuffer[0] = IndexCountHigh;
+	RWIndirectArgsBuffer[1] = 0;
+	RWIndirectArgsBuffer[2] = 0;
+	RWIndirectArgsBuffer[3] = 0;
+	RWIndirectArgsBuffer[4] = 0;
+
+	RWIndirectArgsBuffer[5] = IndexCountLow;
+	RWIndirectArgsBuffer[6] = 0;
+	RWIndirectArgsBuffer[7] = 0;
+	RWIndirectArgsBuffer[8] = 0;
+	RWIndirectArgsBuffer[9] = 0;
+}
+
+/** The append counters can run past the buffer size. Clamp them so the draws never read out of range. */
+[numthreads(1, 1, 1)]
+void FinalizeArgsCS()
+{
+	RWIndirectArgsBuffer[GRASS_ARGS_HIGH_INSTANCE_COUNT] = min(RWIndirectArgsBuffer[GRASS_ARGS_HIGH_INSTANCE_COUNT], MaxBladesHigh);
+	RWIndirectArgsBuffer[GRASS_ARGS_LOW_INSTANCE_COUNT] = min(RWIndirectArgsBuffer[GRASS_ARGS_LOW_INSTANCE_COUNT], MaxBladesLow);
+}
+
+[numthreads(8, 8, 1)]
+void GenerateBladesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint BladesPerSide = max(BladesPerSideLod0 >> DispatchLod, 1u);
+	if (any(DispatchThreadId.xy >= BladesPerSide))
+	{
+		return;
+	}
+
+	const float4 Tile = TileBuffer[TileOffset + DispatchThreadId.z];
+
+	// Every blade is identified by its cell on the LOD0 grid. A LOD k tile only visits every 2^k-th cell,
+	// so the blades it creates are the very same blades a LOD0 tile would create there. That is what makes
+	// LOD changes seamless.
+	const uint2 Cell0 = DispatchThreadId.xy << DispatchLod;
+	const uint2 GlobalCell = uint2(int2(Tile.zw)) * BladesPerSideLod0 + Cell0;
+	const uint Seed = GrassHash2D(GlobalCell);
+
+	// Highest LOD this blade still exists in.
+	const uint LowBits = Cell0.x | Cell0.y;
+	const uint SurviveLevel = (LowBits == 0) ? MaxLod : min((uint)firstbitlow(LowBits), MaxLod);
+
+	// Jitter inside the area the blade is responsible for, so sparse LODs do not look like a grid.
+	const float CellSize0 = TileSize / (float)BladesPerSideLod0;
+	const float2 Jitter = float2(GrassRand(Seed, 0), GrassRand(Seed, 1)) * (float)(1u << SurviveLevel);
+	float3 Position = float3(Tile.xy + ((float2)Cell0 + Jitter) * CellSize0, 0.0f);
+
+	// --- Clumping (Voronoi) ---
+	float2 ClumpCenter;
+	uint ClumpSeed;
+	GrassFindClump(Position.xy, ClumpSize, ClumpCenter, ClumpSeed);
+	Position.xy = lerp(Position.xy, ClumpCenter, ClumpPull * GrassRand(Seed, 2));
+
+	if (any(Position.xy < FieldMin) || any(Position.xy > FieldMax))
+	{
+		return;
+	}
+
+	// --- Continuous LOD ---
+	const float Dist = distance(Position, GrassCameraPosition);
+	const float LodF = max(log2(max(Dist, 1.0f) / Lod0Distance), 0.0f);
+
+	// A blade that does not exist in the next LOD shrinks away over the second half of its last level.
+	float Keep = (SurviveLevel < MaxLod) ? saturate(((float)SurviveLevel + 1.0f - LodF) * 2.0f) : 1.0f;
+	Keep *= 1.0f - smoothstep(MaxDrawDistance * 0.8f, MaxDrawDistance, Dist);
+	if (Keep <= 0.02f)
+	{
+		return;
+	}
+
+	// --- Blade parameters ---
+	const float ClumpRandA = GrassRand(ClumpSeed, 2);
+	const float ClumpRandB = GrassRand(ClumpSeed, 3);
+
+	float Height = BladeHeight * (1.0f + (GrassRand(Seed, 3) * 2.0f - 1.0f) * HeightVariation);
+	Height *= 1.0f + (ClumpRandA * 2.0f - 1.0f) * ClumpHeightVariation;
+
+	// Fewer blades far away, so the remaining ones get wider to keep the coverage.
+	float Width = BladeWidth * lerp(0.75f, 1.25f, GrassRand(Seed, 4));
+	Width *= exp2(min(LodF, (float)MaxLod) * WidthLodScale);
+
+	Height *= Keep;
+	Width *= Keep;
+
+	float Tilt = BaseTilt + (GrassRand(Seed, 5) * 2.0f - 1.0f) * TiltVariation;
+	float Bend = BaseBend * lerp(0.5f, 1.5f, GrassRand(Seed, 6));
+
+	// Facing: random, pulled towards a direction shared by the clump.
+	const float Angle = GrassRand(Seed, 7) * 2.0f * PI;
+	float2 Facing = float2(cos(Angle), sin(Angle));
+	const float ClumpAngle = ClumpRandB * 2.0f * PI;
+	Facing += float2(cos(ClumpAngle), sin(ClumpAngle)) * ClumpFacing * 2.0f;
+
+	// --- Mowing stripes ---
+	// Bands alternate along local X. Each band is simply lighter or darker (StripeContrast, applied to the
+	// brightness below), so a stripe looks the same from every direction, as on a TV broadcast.
+	// The blades used to lean in opposite directions on neighbouring bands, as a real mower leaves them.
+	// That made each stripe flip between light and dark depending on which way the camera looked, which
+	// read as wrong in the game. MowStrength now only combs the whole pitch one way, the same for every band.
+	const uint StripeIndex = (uint)floor((Position.x - FieldMin.x) / max(StripeWidth, 1.0f));
+	const uint StripeParity = StripeIndex & 1u;
+	const float StripeSign = StripeParity ? 1.0f : -1.0f;
+	Facing += float2(0.0f, 1.0f) * MowStrength * 4.0f;
+	Tilt += MowStrength * 0.25f;
+
+	// --- Wind ---
+	// Two octaves of noise scrolling along the wind direction (the talk samples a scrolling 2D noise texture).
+	const float2 WindUV = Position.xy * WindNoiseScale - WindDirection * (GrassTime * WindSpeed * WindNoiseScale);
+	float WindNoise = GrassValueNoise(WindUV) * 0.65f + GrassValueNoise(WindUV * 2.7f + 31.4f) * 0.35f;
+	float Wind = WindNoise * WindStrength;
+	Facing += WindDirection * Wind * 1.5f;
+	Tilt += Wind * 0.25f;
+
+	// --- Interaction: push blades away from nearby objects and flatten them ---
+	const uint InteractorCount = min(NumInteractors, 16u);
+	for (uint InteractorIndex = 0; InteractorIndex < InteractorCount; ++InteractorIndex)
+	{
+		const float4 Interactor = Interactors[InteractorIndex];
+		const float4 InteractorEnd = InteractorEnds[InteractorIndex];
+
+		// Nearest point of the capsule's centre line, seen from above. For a sphere that is its centre.
+		const float2 Segment = InteractorEnd.xy - Interactor.xy;
+		const float SegmentLenSq = dot(Segment, Segment);
+		const float SegmentT = (SegmentLenSq > 0.0001f) ? saturate(dot(Position.xy - Interactor.xy, Segment) / SegmentLenSq) : 0.0f;
+		const float3 Nearest = lerp(Interactor.xyz, InteractorEnd.xyz, SegmentT);
+
+		const float2 Delta = Position.xy - Nearest.xy;
+		const float DeltaLen = length(Delta);
+		// Only the part of the shape that is down in the grass pushes it (a lifted heel does not).
+		const float bTouchesGrass = step(Nearest.z - InteractorEnd.w, Height);
+		const float Push = saturate(1.0f - DeltaLen / max(Interactor.w, 1.0f)) * bTouchesGrass;
+		Facing += (Delta / max(DeltaLen, 0.001f)) * Push * 6.0f;
+		Tilt = lerp(Tilt, 0.95f, Push);
+	}
+
+	const float FacingLen = length(Facing);
+	Facing = (FacingLen > 0.0001f) ? (Facing / FacingLen) : float2(1.0f, 0.0f);
+	Tilt = clamp(Tilt, 0.0f, 0.97f);
+
+	// --- Conform to objects: keep the whole blade underneath whatever is above it ---
+	if (ConformParams.x > 0.5f)
+	{
+		// Check above the root and above where the tip ends up, the blade can reach under an edge.
+		const float TipReach = Height * sin(Tilt * 0.5f * PI);
+		const float UndersideRoot = GrassGetObjectUnderside(Position);
+		const float UndersideTip = GrassGetObjectUnderside(Position + float3(Facing * TipReach, 0.0f));
+		const float Room = min(UndersideRoot, UndersideTip) - ConformParams.z;
+
+		if (Room < Height)
+		{
+			const float Ratio = saturate(Room / max(Height, 0.001f));
+
+			// Lean the blade over until its highest point fits (cos of the tilt angle = how tall it stands).
+			// With no room at all it ends up lying flat on the ground, which is what trodden grass does.
+			// The blade is never removed: one that vanishes under a foot reads as a hole, not a footprint.
+			const float TiltNeeded = acos(Ratio * 0.8f) / (0.5f * PI);
+			Tilt = clamp(max(Tilt, TiltNeeded), 0.0f, 0.975f);
+
+			// A curved or bobbing blade would rise above that again.
+			Bend *= Ratio * 0.5f;
+			Wind *= Ratio;
+
+			// A flattened blade is almost in the plane of the ground. Lift it a hair so the two do not flicker.
+			Position.z += (1.0f - Ratio) * 0.15f;
+		}
+	}
+
+	// --- Frustum culling ---
+	const float4 Clip = mul(float4(Position + float3(0.0f, 0.0f, Height * 0.5f), 1.0f), GrassLocalToClip);
+	const float Margin = (Height + Width) * GrassCullMargin;
+	if (Clip.w < -Margin || any(abs(Clip.xy) > Clip.w + Margin))
+	{
+		return;
+	}
+
+	// --- Colour ---
+	float Brightness = 1.0f;
+	Brightness += (ClumpRandA - 0.5f) * ColorVariation;
+	Brightness += (GrassRand(Seed, 8) - 0.5f) * ColorVariation * 0.5f;
+	Brightness += StripeSign * StripeContrast * 0.5f;
+	const uint BrightnessBits = (uint)round(saturate(Brightness * 0.5f) * 255.0f);
+
+	FGrassBlade Blade;
+	Blade.Position = Position;
+	Blade.Height = Height;
+	Blade.Facing = Facing;
+	Blade.Width = Width;
+	Blade.Tilt = Tilt;
+	Blade.Bend = Bend;
+	Blade.Hash = GrassRand(Seed, 9);
+	Blade.Wind = Wind;
+	Blade.Packed = BrightnessBits | (StripeParity << 8);
+
+	// --- Append ---
+	const bool bHighDetail = LodF < GRASS_HIGH_DETAIL_LOD;
+	uint Index;
+	if (bHighDetail)
+	{
+		InterlockedAdd(RWIndirectArgsBuffer[GRASS_ARGS_HIGH_INSTANCE_COUNT], 1u, Index);
+		if (Index < MaxBladesHigh)
+		{
+			RWInstanceBuffer[Index] = Blade;
+		}
+	}
+	else
+	{
+		InterlockedAdd(RWIndirectArgsBuffer[GRASS_ARGS_LOW_INSTANCE_COUNT], 1u, Index);
+		if (Index < MaxBladesLow)
+		{
+			RWInstanceBuffer[MaxBladesHigh + Index] = Blade;
+		}
+	}
+}

@@ -1,0 +1,25 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1",
+	"FriendlyName": "Procedural Grass",
+	"Description": "GPU driven procedural grass: compute shader blade generation, Bezier blade vertex factory, continuous LOD, mowing stripes and interaction. Based on 'Procedural Grass in Ghost of Tsushima' (GDC 2021).",
+	"Category": "Rendering",
+	"CreatedBy": "",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "ProceduralGrass",
+			"Type": "Runtime",
+			"TargetDenyList": [ "Server" ],
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}
